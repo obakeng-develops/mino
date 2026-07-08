@@ -14,7 +14,7 @@ watch and act on incidents but cannot touch the settings.
 Mino lives on one page. When a container fails, it tells you what broke, why, and what it would do
 about it. Then it acts, or waits for your call.
 
-![A live incident: mino-demo-web is down, diagnosed, waiting for approval to restart](docs/screenshots/now-incident.png)
+<p align="center"><img src="docs/screenshots/now-incident.png" width="440" alt="A live incident: mino-demo-web is down, diagnosed, waiting for approval to restart"></p>
 
 When everything is healthy, it just says so.
 
