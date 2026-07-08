@@ -1,5 +1,7 @@
 # Mino
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 Mino keeps your Docker containers running. It watches them, works out why one failed, restarts
 it within the limits you set, and shows you the whole thing as it happens. Or it stops and asks
 first. That part is your call.
