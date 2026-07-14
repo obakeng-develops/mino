@@ -57,7 +57,9 @@ def _platform_guidance(method: str) -> str:
 
 def _system_prompt(method: str) -> str:
     return (
-        "You are an expert site-reliability engineer diagnosing an incident from a monitored service. "
+        "You diagnose why a monitored service failed. Reason only from the logs and "
+        "metadata below; if they don't show a clear cause, say so and keep confidence low. "
+        "Give the single most likely root cause, then pick the one action (if any) that will fix it. "
         + _platform_guidance(method)
         + " Be concise. Respond with exactly four lines in this format:\n"
         "CAUSE: one-sentence likely root cause\n"
