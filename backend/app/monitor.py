@@ -355,86 +355,109 @@ class ServiceMonitor:
             user = _owner(db)
             if not user:
                 return {}, {}, []
-            existing = {
-                (s.host_id, s.name): s
-                for s in db.query(Service).filter(Service.user_id == user.id).all()
-            }
+            # Services are keyed by a stable identity: the container name with its
+            # per-deploy version suffix stripped (see _service_identity), not the raw
+            # name. On a Kamal host the name carries a git SHA or `latest` that changes
+            # every deploy, so name-keying spawned a fresh service each deploy, left the
+            # old ones as stale rows, and (via the old superseded branch) could delete a
+            # live service and its incident history when it went down. See #111 / #17.
+            host_services = (
+                db.query(Service)
+                .filter(
+                    Service.user_id == user.id,
+                    Service.method == "agent",
+                    Service.host_id == host.id,
+                )
+                .all()
+            )
+            # One-time cleanup: drop legacy rows keyed by the full versioned name so
+            # services re-register under their stable identity. Self-limiting — an
+            # identity-keyed row has name == its identity, so this only fires on the
+            # first sync after this change ships.
+            for s in host_services:
+                if s.name != _service_identity(s.name):
+                    db.delete(s)
+            db.flush()
+            existing = {s.name: s for s in host_services if s.name == _service_identity(s.name)}
             now = datetime.utcnow()
             svc_map: dict[str, dict] = {}
             snapshots: dict[str, _ServiceSnapshot] = {}
             fetch_logs: list[str] = []
-            # Service identities that have a running container this beat. A down
-            # container whose service still has a running sibling is a rollover or
-            # an old version, not an outage. See issue #17.
-            running_identities = {
-                _service_identity(c["name"]) for c in containers if c["status"] != "down"
-            }
+            # Group the host's containers by stable identity. A service can have several
+            # containers at once during a deploy (the new one plus the old it replaced);
+            # they collapse into a single service.
+            groups: dict[str, list[dict]] = {}
             for c in containers:
-                name = c["name"]
-                key = (host.id, name)
-                svc = existing.get(key)
-                superseded = c["status"] == "down" and _service_identity(name) in running_identities
+                groups.setdefault(_service_identity(c["name"]), []).append(c)
+            for identity, members in groups.items():
+                running = [m for m in members if m["status"] != "down"]
+                if running:
+                    # A running container is the current one and defines the service;
+                    # degraded only if the sole running container is unhealthy.
+                    status = "healthy" if any(m["status"] == "healthy" for m in running) else "degraded"
+                    rep = next((m for m in running if m["status"] == "healthy"), running[0])
+                else:
+                    # Nothing running for this identity: a real outage.
+                    status = "down"
+                    rep = members[0]
+                svc = existing.get(identity)
                 if svc is None:
-                    if c["status"] == "down":
-                        # First time we've seen this container and it isn't
-                        # running. It's a pre-existing stopped container — an old
-                        # deploy left behind on a Kamal host, say — not a failure
-                        # we watched happen. Ignore it until it actually comes up,
-                        # so deployment history doesn't show up as a fleet of
-                        # dead services. See issue #17.
+                    if status == "down":
+                        # First time we've seen this identity and nothing is running:
+                        # a pre-existing stopped container (an old deploy left on the
+                        # host), not a failure we watched happen. Ignore it until it
+                        # actually runs, so stale containers don't become dead
+                        # services. See issue #17.
                         continue
                     svc = Service(
                         user_id=user.id,
                         host_id=host.id,
-                        name=name,
+                        name=identity,
                         method="agent",
                         watch_only=False,
                     )
                     db.add(svc)
-                elif superseded:
-                    # We tracked this container while it ran, but a deploy has
-                    # since replaced it with a running sibling. Drop the old
-                    # version so a rollover doesn't read as an outage. The agent
-                    # keeps reporting the stopped container, but it's first-seen
-                    # again next beat and skipped above. See issue #17.
-                    db.delete(svc)
-                    continue
                 else:
                     svc.method = "agent"
                     svc.host_id = host.id
                 prev_status = svc.status
-                svc.status = c["status"]
+                svc.status = status
                 svc.last_check_at = now
-                svc.allowed_fix_action = {"action": "restart_container", "container": name}
+                # Act on the current container's real name, not the identity stem:
+                # `docker restart caready-backend-web-latest`, not `caready-backend-web`.
+                svc.allowed_fix_action = {"action": "restart_container", "container": rep["name"]}
                 svc.agent_host_info = {
-                    "id": c.get("id"),
-                    "image": c.get("image"),
-                    "state": c.get("state"),
-                    "health": c.get("health"),
+                    "id": rep.get("id"),
+                    "image": rep.get("image"),
+                    "state": rep.get("state"),
+                    "health": rep.get("health"),
                     "host_name": host.name,
                     # Present on the log-fetch beat for a failed container; exit 137
                     # / oom_killed means a restart won't durably fix it. See #43.
-                    "exit_code": c.get("exit_code"),
-                    "oom_killed": c.get("oom_killed"),
+                    "exit_code": rep.get("exit_code"),
+                    "oom_killed": rep.get("oom_killed"),
                 }
                 # ponytail: fetch logs once on transition to failed so the
                 # diagnosis has context. The agent returns them on next beat.
-                if prev_status not in FAILED and c["status"] in FAILED:
-                    fetch_logs.append(name)
+                if prev_status not in FAILED and status in FAILED:
+                    fetch_logs.append(rep["name"])
                 db.flush()
                 db.refresh(svc)
-                svc_map[name] = {"service_id": svc.id, "watch_only": svc.watch_only, "host_id": host.id}
-                snapshots[name] = _ServiceSnapshot(
+                info = {"service_id": svc.id, "watch_only": svc.watch_only, "host_id": host.id}
+                svc_map[identity] = info
+                # Pending restarts are keyed by the real container name handed to the agent.
+                svc_map[rep["name"]] = info
+                snapshots[identity] = _ServiceSnapshot(
                     service_id=svc.id,
-                    name=name,
-                    status=c["status"],
+                    name=identity,
+                    status=status,
                     method="agent",
                     host_id=host.id,
                     watch_only=svc.watch_only,
                     host_name=host.name,
-                    image=c.get("image"),
-                    state=c.get("state"),
-                    health=c.get("health"),
+                    image=rep.get("image"),
+                    state=rep.get("state"),
+                    health=rep.get("health"),
                     allowed_fix_action=svc.allowed_fix_action,
                 )
             db.commit()
@@ -454,9 +477,15 @@ class ServiceMonitor:
             for name, text in logs.items():
                 if not text:
                     continue
+                # Logs arrive keyed by the real container name; services are keyed by
+                # the stable identity, so map the name to its identity to find the row.
                 service = (
                     db.query(Service)
-                    .filter(Service.user_id == user.id, Service.host_id == host.id, Service.name == name)
+                    .filter(
+                        Service.user_id == user.id,
+                        Service.host_id == host.id,
+                        Service.name == _service_identity(name),
+                    )
                     .first()
                 )
                 if not service:
@@ -581,8 +610,8 @@ class ServiceMonitor:
                                 if self._method == "fly" and isinstance(self._proposed_fix_action, dict):
                                     # Keep the machine target (id + app); swap only the verb.
                                     self._proposed_fix_action = {**self._proposed_fix_action, "action": self._llm_action}
-                                elif self._container:
-                                    self._proposed_fix_action = {"action": self._llm_action, "container": self._container}
+                                elif self._proposed_fix:
+                                    self._proposed_fix_action = {"action": self._llm_action, "container": self._proposed_fix}
                         self._llm_ready.set()
                         self._broadcast_state()
         finally:
@@ -823,7 +852,7 @@ class ServiceMonitor:
         """Queue or perform a restart using only whitelisted actions."""
         self._restart_history.setdefault(self._container, []).append(datetime.utcnow())
         if self._method == "agent":
-            action = self._proposed_fix_action or {"action": "restart_container", "container": self._container}
+            action = self._proposed_fix_action or {"action": "restart_container", "container": self._proposed_fix}
             if not _is_allowed_action(action):
                 logger.warning("refusing disallowed action: %s", action)
                 await self._finish("escalated", "Refusing unsafe fix command. Handed to you")
@@ -850,7 +879,7 @@ class ServiceMonitor:
             self._elapsed = 0
             self._fixing_since = datetime.utcnow()
         else:
-            token = executor_client.sign_action("restart_container", self._container)
+            token = executor_client.sign_action("restart_container", self._proposed_fix)
             ok, err = await executor_client.send_action(self._executor_url(), token)
             if not ok:
                 logger.warning("local executor restart failed: %s", err)
