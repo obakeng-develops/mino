@@ -426,7 +426,7 @@
 									I've stepped back and won't touch anything. Here's the fix I was about to run, if it helps:
 								</div>
 								<div class="mt-4 bg-surface-950 rounded-xl px-[18px] py-4 font-mono text-label leading-relaxed text-surface-300">
-									<span class="text-surface-500">$</span> {$activeIncident.proposed_fix || `docker ${actionVerb($activeIncident.proposed_action)} ${$activeIncident.service_name}`}
+									<span class="text-surface-500">$</span> {$activeIncident.proposed_fix || `${$activeIncident.method === 'fly' ? 'fly machine' : 'docker'} ${actionVerb($activeIncident.proposed_action)} ${$activeIncident.service_name}`}
 								</div>
 							{/if}
 							<div class="mt-3.5 flex gap-4">

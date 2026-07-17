@@ -1240,7 +1240,9 @@ class ServiceMonitor:
             db.close()
 
     def _record_learning(self, db: Session, incident: Incident):
-        rule_text = f"When {self._service_name} goes unhealthy, a docker restart brings it back."
+        # A Fly Machine isn't Docker; name the platform honestly.
+        platform = "fly" if self._method == "fly" else "docker"
+        rule_text = f"When {self._service_name} goes unhealthy, a {platform} restart brings it back."
         # Match on the rule, not the service id. A re-added host gives the same
         # container a fresh service id, and keying on it spawned a duplicate card
         # for what is the same recurring behavior.
