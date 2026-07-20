@@ -35,6 +35,10 @@ logger = logging.getLogger("oncall.monitor")
 
 ACTIVE_VIEWS = ("detecting", "diagnosing", "fixing", "verifying")
 FAILED = ("down", "degraded")
+# How long the "recovered" card lingers before the Now page returns to resting.
+# Without a dwell the view flips on the next agent beat (~2s) and the confirmation
+# that the service came back flashes by. See #113.
+RESOLVED_DWELL_SECONDS = 8
 
 
 def _owner(db: Session) -> User | None:
@@ -106,6 +110,7 @@ class ServiceMonitor:
         self._opened_at: datetime | None = None  # set on open; for the wide event's duration
         self._fixing_since: datetime | None = None  # set when a restart is issued; drives the verify timeout
         self._view: str = "resting"
+        self._resolved_at: datetime | None = None  # when the view entered resolved; holds the recovered card
         self._elapsed: int = 0
         self._autonomy: str = "ask_first"
         self._service_id: str | None = None
@@ -686,8 +691,18 @@ class ServiceMonitor:
                 target = c
         if not target:
             if self._view == "resolved":
-                self._view = "resting"
-                self._broadcast_state()
+                # Hold the recovered card for a short dwell so the recovery is
+                # actually visible; otherwise it flips on the next beat (~2s) and
+                # the confirmation flashes by. A new failure still interrupts it
+                # (target is set above before we reach here). See #113.
+                held = (
+                    self._resolved_at is not None
+                    and (datetime.utcnow() - self._resolved_at).total_seconds() < RESOLVED_DWELL_SECONDS
+                )
+                if not held:
+                    self._view = "resting"
+                    self._resolved_at = None
+                    self._broadcast_state()
             return
 
         info = await asyncio.to_thread(self._open_incident, target)
@@ -1032,6 +1047,7 @@ class ServiceMonitor:
 
     def _reset_to_resting(self):
         self._view = "resting"
+        self._resolved_at = None
         self._incident_id = None
         self._fixing_since = None
         self._service_id = None
@@ -1073,6 +1089,7 @@ class ServiceMonitor:
             else None,
         )
         self._view = "resolved"
+        self._resolved_at = datetime.utcnow()
         self._tail_logs = False
         self._llm_diagnosis = None
         self._llm_suggested_fix = None
@@ -1223,7 +1240,9 @@ class ServiceMonitor:
             db.close()
 
     def _record_learning(self, db: Session, incident: Incident):
-        rule_text = f"When {self._service_name} goes unhealthy, a docker restart brings it back."
+        # A Fly Machine isn't Docker; name the platform honestly.
+        platform = "fly" if self._method == "fly" else "docker"
+        rule_text = f"When {self._service_name} goes unhealthy, a {platform} restart brings it back."
         # Match on the rule, not the service id. A re-added host gives the same
         # container a fresh service id, and keying on it spawned a duplicate card
         # for what is the same recurring behavior.
