@@ -57,9 +57,11 @@ def _platform_guidance(method: str) -> str:
 
 def _system_prompt(method: str) -> str:
     return (
-        "You diagnose why a monitored service failed. Reason only from the logs and "
-        "metadata below; if they don't show a clear cause, say so and keep confidence low. "
-        "Give the single most likely root cause, then pick the one action (if any) that will fix it. "
+        "You diagnose why a monitored service failed. Reason from the logs, metadata, and any past "
+        "incidents below; if they don't show a clear cause, say so and keep confidence low. Give the "
+        "single most likely root cause, then pick the one action (if any) that will fix it. When this "
+        "service has failed before, weigh whether the usual fix held: a fix that already failed is a "
+        "reason to hand off, a recurring blip the fix always clears is a reason for confidence. "
         + _platform_guidance(method)
         + " Be concise. Respond with exactly four lines in this format:\n"
         "CAUSE: one-sentence likely root cause\n"
@@ -89,6 +91,10 @@ def _user_prompt(context: dict) -> str:
         lines.append("OOM-killed: true (the kernel killed it for exceeding its memory limit)")
     if context.get("location"):
         lines.append(f"Location: {context['location']}")
+    history = context.get("history")
+    if history:
+        lines.append("")
+        lines.append(history)
     logs = context.get("logs")
     if logs:
         lines.append("")
