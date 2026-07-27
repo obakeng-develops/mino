@@ -52,6 +52,19 @@ def _learned_from(incidents: int, successes: int) -> str:
     return f"learned from {incidents} {noun} · recovered {successes} / {incidents}"
 
 
+def _ago(then: datetime, now: datetime) -> str:
+    secs = max(0, int((now - then).total_seconds()))
+    if secs < 90:
+        return "just now"
+    mins = secs // 60
+    if mins < 90:
+        return f"{mins}m ago"
+    hours = mins // 60
+    if hours < 36:
+        return f"{hours}h ago"
+    return f"{hours // 24}d ago"
+
+
 # Strip a container's version suffix to get the service it belongs to. Kamal
 # names containers <service>-<role>-<git-sha>, <service>-<role>-latest, and
 # tacks on _replaced_<hex> when it rolls one out. All of those are one service.
@@ -544,6 +557,55 @@ class ServiceMonitor:
         finally:
             db.close()
 
+    @staticmethod
+    def _incident_history(service_id: str, exclude_incident_id: str | None, limit: int = 5) -> str | None:
+        """A compact summary of this service's recent incidents and what it has learned,
+        so the LLM can reason across time: is this recurring, and did the usual fix hold?
+        Returns None when there's no prior history. Kept short to protect the token budget."""
+        db = SessionLocal()
+        try:
+            now = datetime.utcnow()
+            rows = (
+                db.query(Incident)
+                .filter(
+                    Incident.service_id == service_id,
+                    Incident.id != exclude_incident_id,
+                    Incident.status.in_(("resolved", "escalated", "took_over")),
+                )
+                .order_by(Incident.started_at.desc())
+                .limit(limit)
+                .all()
+            )
+            lines: list[str] = []
+            for inc in rows:
+                cause = (inc.llm_diagnosis or inc.summary or "unknown cause").strip().replace("\n", " ")
+                if len(cause) > 120:
+                    cause = cause[:117] + "…"
+                outcome = {
+                    "resolved": inc.action_taken or "recovered",
+                    "escalated": "handed to a human",
+                    "took_over": "a human took over",
+                }.get(inc.status, inc.status)
+                lines.append(f"- {_ago(inc.started_at, now)}: {cause} → {outcome}")
+            if not lines:
+                return None
+            block = ["Past incidents for this service (most recent first):", *lines]
+            learnings = (
+                db.query(Learning)
+                .filter(Learning.service_id == service_id)
+                .order_by(Learning.updated_at.desc())
+                .limit(2)
+                .all()
+            )
+            for lrn in learnings:
+                block.append(
+                    f'What Mino learned here: "{lrn.rule}" '
+                    f"(seen {lrn.incident_count}×, recovered {lrn.success_count}/{lrn.incident_count})"
+                )
+            return "\n".join(block)
+        finally:
+            db.close()
+
     async def _request_llm_diagnosis(
         self,
         incident_id: str,
@@ -570,6 +632,7 @@ class ServiceMonitor:
                 )
             ),
             "logs": logs,
+            "history": self._incident_history(service.id, incident_id),
         }
         try:
             result = await llm_client.diagnose(
