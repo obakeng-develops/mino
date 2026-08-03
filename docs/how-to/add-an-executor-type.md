@@ -4,7 +4,8 @@ Mino watches Docker today. The kind of thing a service runs on is its **executor
 carried by the service's `method`:
 
 - `agent` and `docker` — a Docker container Mino can `docker restart`.
-- `url` — an HTTP endpoint Mino can only alert on.
+- `url` — an HTTP endpoint. Alert-only by default; give it a host and a whitelisted fix and Mino
+  runs that fix through the host's agent. See [Fix a URL check](fix-a-url-check.md).
 
 Adding a new type, say Kubernetes, means teaching four parts of the system about it. Only one of them
 is a one-line change; the rest is real work, so this guide is a map, not a recipe.

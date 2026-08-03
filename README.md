@@ -68,6 +68,7 @@ The docs follow [Diátaxis](https://diataxis.fr/). Pick the door that matches wh
 - [Deploy with fly.io](docs/how-to/deploy-with-fly.md)
 - [Deploy with Kamal](docs/how-to/deploy-with-kamal.md)
 - [Install the agent on a host](docs/how-to/install-the-agent.md)
+- [Let Mino fix a URL check](docs/how-to/fix-a-url-check.md)
 - [Choose an LLM provider](docs/how-to/choose-an-llm-provider.md)
 - [Manage your team](docs/how-to/manage-your-team.md)
 - [Add an executor type](docs/how-to/add-an-executor-type.md)
