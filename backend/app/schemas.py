@@ -103,12 +103,18 @@ class ServiceOut(BaseModel):
 
 class ServiceUpdate(BaseModel):
     watch_only: bool | None = None
+    # Set both to let Mino fix a URL service: the host whose agent runs the fix,
+    # and the whitelisted action to run. Without both it stays alert-only.
+    host_id: str | None = None
+    allowed_fix_action: dict | None = None
 
 
 class ServiceCreate(BaseModel):
     name: str
     method: str = "url"
     health_check_url: str
+    host_id: str | None = None
+    allowed_fix_action: dict | None = None
 
 
 class HostOut(BaseModel):

@@ -1,12 +1,26 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from app.actions import is_allowed_action
 from app.deps import allowed_host_ids, get_current_user, get_db_session, host_allowed, require_owner
-from app.models import Service, User
+from app.models import Host, Service, User
 from app.schemas import ServiceCreate, ServiceOut, ServiceUpdate
 from app.stream import stream_manager
 
 router = APIRouter(prefix="/services", tags=["services"])
+
+
+def _check_fix(db: Session, user: User, host_id: str | None, action: dict | None):
+    """A fix has to name one of this user's hosts and an action on the whitelist.
+    Checked here as well as before execution: the whitelist stays the one safety
+    boundary, but a bad fix should fail when it is configured rather than go quiet
+    until an incident needs it."""
+    if action is not None and not is_allowed_action(action):
+        raise HTTPException(status_code=400, detail="Fix action is not on the whitelist")
+    if host_id is not None:
+        host = db.query(Host).filter(Host.id == host_id, Host.user_id == user.id).first()
+        if not host:
+            raise HTTPException(status_code=404, detail="Host not found")
 
 
 def _service_out(service: Service) -> ServiceOut:
@@ -48,13 +62,16 @@ def create_service(
 ):
     if body.method != "url":
         raise HTTPException(status_code=400, detail="Only 'url' services can be created manually")
+    _check_fix(db, user, body.host_id, body.allowed_fix_action)
     service = Service(
         user_id=user.id,
         name=body.name,
         method="url",
         health_check_url=body.health_check_url,
         status="healthy",
-        allowed_fix_action=None,
+        # Both together make the endpoint fixable; either alone leaves it alert-only.
+        host_id=body.host_id,
+        allowed_fix_action=body.allowed_fix_action,
     )
     db.add(service)
     db.commit()
@@ -76,7 +93,14 @@ def update_service(
     service = db.query(Service).filter(Service.id == service_id, Service.user_id == user.id).first()
     if not service:
         raise HTTPException(status_code=404, detail="Service not found")
-    for key, value in update.model_dump(exclude_unset=True).items():
+    fields = update.model_dump(exclude_unset=True)
+    _check_fix(
+        db,
+        user,
+        fields.get("host_id", service.host_id),
+        fields.get("allowed_fix_action", service.allowed_fix_action),
+    )
+    for key, value in fields.items():
         setattr(service, key, value)
     db.commit()
     db.refresh(service)

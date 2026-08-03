@@ -31,9 +31,15 @@ def _headers(api_key: str) -> dict:
 def _platform_guidance(method: str) -> str:
     if method == "url":
         return (
-            "This service is an HTTP endpoint. Mino monitors it but CANNOT restart "
-            "or change it; it can only alert a human. Your FIX must be something a "
-            "person should check or do, not a command Mino can run."
+            "This service is an HTTP endpoint. Mino monitors it and cannot restart "
+            "it. Your FIX must be something a person should check or do, not a "
+            "command Mino can run, and your ACTION must be none — where the operator "
+            "has configured a remediation for this endpoint (such as re-registering "
+            "a missing reverse-proxy route), Mino runs that itself and does not need "
+            "you to name it. If the check failed because the connection or the TLS "
+            "handshake was refused rather than with a status code, the process behind "
+            "it may well be healthy: say so, and point at what sits in front of it "
+            "(proxy route, certificate, DNS, firewall) instead of blaming the app."
         )
     if method == "fly":
         return (
@@ -91,6 +97,8 @@ def _user_prompt(context: dict) -> str:
         lines.append("OOM-killed: true (the kernel killed it for exceeding its memory limit)")
     if context.get("location"):
         lines.append(f"Location: {context['location']}")
+    if context.get("check_failure"):
+        lines.append(f"How the check failed: {context['check_failure']}")
     history = context.get("history")
     if history:
         lines.append("")
