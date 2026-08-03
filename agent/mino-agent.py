@@ -24,7 +24,7 @@ logger = logging.getLogger("mino-agent")
 # Bumped whenever the agent script changes. Reported on every beat so Mino can
 # flag hosts running an out-of-date agent. The server compares it against the
 # version of the script it currently serves.
-AGENT_VERSION = "2026-06-29"
+AGENT_VERSION = "2026-07-26"
 
 
 def run_docker_ps():
@@ -78,6 +78,72 @@ _ACTION_CMD = {
     "stop_container": "stop",
     "start_container": "start",
 }
+
+
+def container_ip(name):
+    """The container's IP on its Docker network, or None. Resolved here, at fix
+    time, rather than carried in the action — a container's IP changes when it is
+    recreated, so an IP decided by the backend minutes earlier can be stale."""
+    try:
+        proc = subprocess.run(
+            [
+                "docker", "inspect", "-f",
+                "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}", name,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except Exception as exc:
+        logger.error("docker inspect %s failed: %s", name, exc)
+        return None
+    if proc.returncode != 0:
+        logger.warning("docker inspect %s: %s", name, proc.stderr.strip())
+        return None
+    ips = proc.stdout.split()
+    return ips[0] if ips else None
+
+
+def register_proxy_route(action):
+    """Point a reverse-proxy hostname back at a running container.
+
+    A container can be healthy while its public hostname is dead, because the
+    proxy holds no route for it — so it serves no certificate and aborts the TLS
+    handshake (browsers report ERR_SSL_PROTOCOL_ERROR). No restart fixes that;
+    the route has to be registered again.
+
+    ponytail: kamal-proxy only, which is what Mino's Docker hosts run. Another
+    proxy means another branch here, keyed off the action.
+    """
+    target_name = action.get("container")
+    ip = container_ip(target_name)
+    if not ip:
+        logger.error("no IP for %s — cannot register a proxy route to it", target_name)
+        return False
+    cmd = [
+        "docker", "exec", action["proxy"], "kamal-proxy", "deploy", action["service"],
+        "--target", f"{ip}:{action['port']}",
+        "--host", action["host"],
+    ]
+    if action.get("tls"):
+        cmd.append("--tls")
+    # kamal-proxy probes the target before accepting it, and defaults that probe to
+    # /up — a Rails convention. An app serving anything else never reports healthy
+    # and the registration times out, so the path is configurable per service.
+    if action.get("health_check_path"):
+        cmd += ["--health-check-path", action["health_check_path"]]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+    except Exception as exc:
+        logger.error("proxy route registration failed: %s", exc)
+        return False
+    if proc.returncode != 0:
+        logger.warning(
+            "kamal-proxy deploy %s: %s", action["service"], (proc.stderr or proc.stdout).strip()
+        )
+        return False
+    return True
 
 
 def docker_action(action_name, name):
@@ -264,7 +330,21 @@ def main():
                         if not name:
                             continue
                         logger.info("running %s on %s", act, name)
-                        if docker_action(act, name):
+                        if act == "register_proxy_route":
+                            # The backend validates these before sending; check
+                            # again so a malformed action logs instead of raising
+                            # and killing the beat loop.
+                            missing = [
+                                k for k in ("proxy", "service", "host", "port")
+                                if not action.get(k)
+                            ]
+                            if missing:
+                                logger.error("proxy route action missing %s: %s", missing, action)
+                                continue
+                            ok = register_proxy_route(action)
+                        else:
+                            ok = docker_action(act, name)
+                        if ok:
                             logger.info("%s ok: %s", act, name)
                         else:
                             logger.error("%s failed: %s", act, name)
