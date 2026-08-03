@@ -16,6 +16,14 @@ run() {
 }
 
 run "python3 -m compileall -q backend/app executor/app llm-service/app agent"
+# Self-checks on the logic that is cheap to get wrong and expensive to get wrong in
+# production: the action whitelist and the incident state machine. They never touch
+# the database, but importing the app builds an engine, so point it at throwaway
+# in-memory SQLite rather than whatever DATABASE_URL happens to be set here.
+# Each in a subshell: run() evals in the current shell, so a bare cd would leak
+# into the frontend gates below and they would look for frontend/ inside backend/.
+run "(cd backend && DATABASE_URL='sqlite://' python3 -m app.actions)"
+run "(cd backend && DATABASE_URL='sqlite://' python3 -m app.monitor_check)"
 run "npm --prefix frontend run check"
 run "npm --prefix frontend run build"
 run "docker compose config -q"
