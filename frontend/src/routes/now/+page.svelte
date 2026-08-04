@@ -12,7 +12,7 @@
 	import Button from '$lib/components/ui/Button.svelte';
 	import Badge from '$lib/components/ui/Badge.svelte';
 	import { groupByServer, serverRollup } from '$lib/grouping';
-	import type { Service, UserSettings } from '$lib/types';
+	import type { ActiveIncidentState, Service, UserSettings } from '$lib/types';
 
 	let settings: UserSettings | null = null;
 	// Services are owned by the layout, which keeps servicesStore fresh. See #74.
@@ -150,9 +150,28 @@
 	$: statusText = $activeIncident?.status_text || summaryText();
 
 	const actionVerb = (a?: string | null) =>
-		a === 'stop_container' ? 'stop' : a === 'start_container' ? 'start' : 'restart';
+		a === 'stop_container'
+			? 'stop'
+			: a === 'start_container'
+				? 'start'
+				: a === 'register_proxy_route'
+					? 're-register the proxy route for'
+					: 'restart';
 	const actionGerund = (a?: string | null) =>
-		a === 'stop_container' ? 'stopping' : a === 'start_container' ? 'starting' : 'restarting';
+		a === 'stop_container'
+			? 'stopping'
+			: a === 'start_container'
+				? 'starting'
+				: a === 'register_proxy_route'
+					? 're-registering the proxy route for'
+					: 'restarting';
+	// The command Mino would run, when it hasn't supplied one of its own. A
+	// proxy-route fix is a kamal-proxy deploy, not a docker verb.
+	const fixCommand = (i: ActiveIncidentState) =>
+		i.proposed_fix ||
+		(i.proposed_action === 'register_proxy_route'
+			? `kamal-proxy deploy ${i.service_name}`
+			: `${i.method === 'fly' ? 'fly machine' : 'docker'} ${actionVerb(i.proposed_action)} ${i.service_name}`);
 </script>
 
 <div class="px-4 sm:px-10 py-7 sm:py-9 pb-20">
@@ -228,8 +247,8 @@
 						<div class="p-5 sm:p-9" in:contentFly|local>
 							<div class="flex justify-between items-start gap-4">
 								<div class="font-serif text-title leading-snug text-surface-900 tracking-tight">
-									{#if $activeIncident.method === 'url'}
-										{$activeIncident.service_name} is unreachable. I can't restart a URL check. Here's what I found.
+									{#if $activeIncident.method === 'url' && !$activeIncident.can_approve}
+										{$activeIncident.service_name} is unreachable and there's nothing I can run for it. Here's what I found.
 									{:else if !$activeIncident.can_approve}
 										{$activeIncident.service_name} is down. A restart won't fix this. Here's what I found.
 									{:else}
@@ -414,9 +433,9 @@
 						<div class="p-5 sm:p-9" in:contentFly|local>
 							<Badge pill variant={badge.variant} tone={badge.tone}>{badgeLabel()}</Badge>
 							<div class="mt-4 font-serif text-title leading-snug text-surface-900 tracking-tight">Okay, it's yours.</div>
-							{#if $activeIncident.method === 'url'}
+							{#if !$activeIncident.proposed_action}
 								<div class="mt-3.5 font-serif text-base leading-relaxed text-surface-600">
-									I've stepped back. I can't restart a URL check. Here's what I found:
+									I've stepped back. There's nothing I can run for this one. Here's what I found:
 								</div>
 								<div class="mt-4 bg-surface-50 border border-surface-200 rounded-xl px-[18px] py-4 font-sans text-label leading-relaxed text-surface-700">
 									{$activeIncident.proposed_fix || $activeIncident.llm_diagnosis || 'The endpoint failed its health check. Check that it is up and reachable.'}
@@ -426,7 +445,7 @@
 									I've stepped back and won't touch anything. Here's the fix I was about to run, if it helps:
 								</div>
 								<div class="mt-4 bg-surface-950 rounded-xl px-[18px] py-4 font-mono text-label leading-relaxed text-surface-300">
-									<span class="text-surface-500">$</span> {$activeIncident.proposed_fix || `${$activeIncident.method === 'fly' ? 'fly machine' : 'docker'} ${actionVerb($activeIncident.proposed_action)} ${$activeIncident.service_name}`}
+									<span class="text-surface-500">$</span> {fixCommand($activeIncident)}
 								</div>
 							{/if}
 							<div class="mt-3.5 flex gap-4">

@@ -4,7 +4,9 @@ Drives the same ActiveIncidentState + SSE contract the frontend already consumes
 Sources of failure:
 - agent: tiny agent on a user's server reports containers; fixed by queueing docker restart
        commands sent back via the next heartbeat
-- url: HTTP health check, alert/escalate only — no auto-restart
+- url: HTTP health check. Alert/escalate only, unless the service carries a whitelisted
+       allowed_fix_action and the host that can run it — then it takes the same
+       diagnose → ask/act → verify path as a container (see _url_fix_ready)
 
 ponytail: single active incident at a time, matching the single "Now" card. If several
 services fail at once, the others still show status=down in the Services list and get
@@ -93,6 +95,7 @@ class _ServiceSnapshot:
         health: str | None = None,
         url: str | None = None,
         allowed_fix_action: dict | None = None,
+        reason: str | None = None,
     ):
         self.service_id = service_id
         self.name = name
@@ -106,6 +109,9 @@ class _ServiceSnapshot:
         self.health = health
         self.url = url
         self.allowed_fix_action = allowed_fix_action
+        # Why a check failed, when the source knows. For a URL that is the whole
+        # diagnosis: "TLS handshake aborted" and "HTTP 503" are different outages.
+        self.reason = reason
 
     def display_location(self) -> str:
         if self.method == "url":
@@ -132,6 +138,7 @@ class ServiceMonitor:
         self._method: str | None = None
         self._host_id: str | None = None
         self._severity: str = "down"
+        self._check_failure: str | None = None  # how the failing check failed, if known
         self._proposed_fix: str | None = None
         self._proposed_fix_action: dict | None = None
         self._user_id: str | None = None
@@ -205,16 +212,19 @@ class ServiceMonitor:
         snapshots: dict[str, _ServiceSnapshot] = {}
         async with httpx.AsyncClient(timeout=10) as client:
             for svc in services:
-                status = await self._check_one_url(client, svc.health_check_url)
+                status, reason = await self._check_one_url(client, svc.health_check_url)
                 snapshots[svc.name] = _ServiceSnapshot(
                     service_id=svc.id,
                     name=svc.name,
                     status=status,
                     method="url",
-                    host_id=None,
+                    # A URL service can name the host whose agent runs its fix.
+                    # Null (the default) keeps it alert-only.
+                    host_id=svc.host_id,
                     watch_only=svc.watch_only,
                     url=svc.health_check_url,
                     allowed_fix_action=svc.allowed_fix_action,
+                    reason=reason,
                 )
         await asyncio.to_thread(self._persist_url_statuses, snapshots)
         await self._process_sources(snapshots, source_name="url")
@@ -233,14 +243,28 @@ class ServiceMonitor:
         finally:
             db.close()
 
-    async def _check_one_url(self, client: httpx.AsyncClient, url: str | None) -> str:
+    async def _check_one_url(
+        self, client: httpx.AsyncClient, url: str | None
+    ) -> tuple[str, str | None]:
+        """(status, reason). The reason is what makes a URL incident diagnosable:
+        a refused connection, an aborted TLS handshake and a 503 all look
+        identical as "down", and they need different fixes."""
         if not url:
-            return "down"
+            return "down", "no health check URL is set"
         try:
             resp = await client.get(url)
-            return "healthy" if resp.status_code < 300 else "down"
-        except Exception:
-            return "down"
+            if resp.status_code < 300:
+                return "healthy", None
+            return "down", f"the endpoint answered HTTP {resp.status_code}"
+        except httpx.ConnectError as exc:
+            # A proxy holding no route for the hostname serves no certificate and
+            # aborts the handshake, which surfaces here rather than as a status
+            # code. That is the outage a restart cannot fix.
+            return "down", f"could not connect: {exc}"
+        except httpx.TimeoutException:
+            return "down", "the endpoint did not respond in time"
+        except Exception as exc:
+            return "down", f"{type(exc).__name__}: {exc}"
 
     def _persist_url_statuses(self, snapshots: dict[str, _ServiceSnapshot]):
         db = SessionLocal()
@@ -356,9 +380,15 @@ class ServiceMonitor:
             restarts: list[dict] = []
             to_clear: list[str] = []
             for sid, action in list(self._pending_agent_restarts.items()):
-                name = action.get("container")
-                svc = svc_map.get(name) if name else None
-                if svc and svc.get("host_id") == host.id:
+                if action.get("host_id"):
+                    # The host was decided when the fix was queued. A URL service's
+                    # fix has no container in this beat's svc_map to look up.
+                    matches = action["host_id"] == host.id
+                else:
+                    name = action.get("container")
+                    svc = svc_map.get(name) if name else None
+                    matches = bool(svc and svc.get("host_id") == host.id)
+                if matches:
                     restarts.append(action)
                     to_clear.append(sid)
             for sid in to_clear:
@@ -633,6 +663,9 @@ class ServiceMonitor:
             ),
             "logs": logs,
             "history": self._incident_history(service.id, incident_id),
+            # How the check failed, when the source knew — a refused TLS handshake
+            # points somewhere completely different than an HTTP 503.
+            "check_failure": self._check_failure,
         }
         try:
             result = await llm_client.diagnose(
@@ -721,7 +754,7 @@ class ServiceMonitor:
         if self._opened_at:
             self._elapsed = int((now - self._opened_at).total_seconds())
         if cur and cur.status == "healthy":
-            await self._finish("resolved", f"Restarted {self._container}. It came back healthy")
+            await self._finish("resolved", f"{self._fix_done_phrase()}. It came back healthy")
             return
         # The verify timeout is wall-clock since the restart was issued, so it
         # doesn't depend on how often — or from how many sources — the monitor
@@ -739,6 +772,37 @@ class ServiceMonitor:
         if self._view == "fixing":
             self._view = "verifying"
         self._broadcast_state()
+
+    def _url_fix_ready(self) -> bool:
+        """Whether a down URL has a fix Mino can actually run: a whitelisted action
+        and the host whose agent will carry it out. Without both, the endpoint stays
+        alert-only — the old behaviour for every URL service."""
+        return bool(
+            self._host_id
+            and isinstance(self._proposed_fix_action, dict)
+            and _is_allowed_action(self._proposed_fix_action)
+        )
+
+    def _restart_family(self) -> bool:
+        """Whether the proposed fix is a container restart/stop/start. The model's
+        "no action will help" verdict is a judgement about bouncing a container, so
+        it only vetoes those — not, say, re-registering a proxy route, which is a
+        fix the operator configured for exactly this failure."""
+        return (self._proposed_fix_action or {}).get("action") in (
+            "restart_container",
+            "stop_container",
+            "start_container",
+        )
+
+    def _fix_vetoed(self) -> bool:
+        return self._llm_action == "none" and self._restart_family()
+
+    def _fix_done_phrase(self) -> str:
+        """What Mino did, for the incident record. "Restarted" is a lie about a
+        proxy route, and these lines are what the LLM reads back as history."""
+        if (self._proposed_fix_action or {}).get("action") == "register_proxy_route":
+            return f"Re-registered the proxy route for {self._container}"
+        return f"Restarted {self._container}"
 
     async def _maybe_open(self, by_name: dict[str, _ServiceSnapshot]):
         newly_failed = [
@@ -780,6 +844,7 @@ class ServiceMonitor:
         self._method = target.method
         self._host_id = target.host_id
         self._severity = "down" if target.status == "down" else "degraded"
+        self._check_failure = target.reason
         self._autonomy = info["autonomy"]
         self._escalate_on = info["escalate_on"]
         self._tail_logs = target.method == "agent"
@@ -794,8 +859,8 @@ class ServiceMonitor:
 
         stream_manager.broadcast("incident_created", {"incident_id": self._incident_id})
 
-        if self._method == "url":
-            # Mino can't act on a URL endpoint. There are no logs to fetch, so
+        if self._method == "url" and not self._url_fix_ready():
+            # Nothing runnable for this endpoint. There are no logs to fetch, so
             # diagnose from status and hand it to a human — never offer a fix we
             # can't perform. See issues #33, #35.
             self._proposed_fix = None
@@ -805,8 +870,8 @@ class ServiceMonitor:
             self._awaiting_logs_task = asyncio.create_task(self._diagnose_url_then_ask())
         elif self._autonomy == "ask_first":
             self._view = "detecting"
-            if self._method == "fly":
-                # A Fly machine has no agent logs; diagnose from state, then ask.
+            if self._method in ("fly", "url"):
+                # No agent logs for either; diagnose from state, then ask.
                 self._logs_arrived.set()
                 self._awaiting_logs_task = asyncio.create_task(self._diagnose_url_then_ask())
             else:
@@ -819,8 +884,8 @@ class ServiceMonitor:
             # This keeps the dashboard useful and gives the LLM context.
             self._view = "detecting"
             self._awaiting_logs_task = asyncio.create_task(self._wait_then_restart())
-        elif self._method == "fly":
-            # No logs to wait for; diagnose from machine state, then restart.
+        elif self._method in ("fly", "url"):
+            # No logs to wait for; diagnose from what we know, then act.
             self._view = "detecting"
             self._logs_arrived.set()
             self._awaiting_logs_task = asyncio.create_task(self._diagnose_fly_then_restart())
@@ -904,7 +969,7 @@ class ServiceMonitor:
             pass
         async with self._lock:
             if self._view in ("detecting", "diagnosing") and self._incident_id:
-                if self._llm_action == "none":
+                if self._fix_vetoed():
                     # The model judged a restart won't help — don't auto-restart
                     # into the same failure; hand it to a person. See issue #44.
                     await self._finish("escalated", "A restart likely won't fix this. Handed to you")
@@ -913,14 +978,14 @@ class ServiceMonitor:
                 self._broadcast_state()
 
     async def _diagnose_fly_then_restart(self, llm_timeout: float = 20.0):
-        # A Fly machine has no agent logs; diagnose from its state, then act.
+        # Neither a Fly machine nor a URL has agent logs; diagnose from state, then act.
         try:
             await asyncio.wait_for(self._diagnose_url(self._incident_id, self._service_id), timeout=llm_timeout)
         except (asyncio.TimeoutError, Exception):
             pass
         async with self._lock:
             if self._view in ("detecting", "diagnosing") and self._incident_id:
-                if self._llm_action == "none":
+                if self._fix_vetoed():
                     await self._finish("escalated", "A restart likely won't fix this. Handed to you")
                 else:
                     await self._do_restart()
@@ -935,12 +1000,22 @@ class ServiceMonitor:
                 logger.warning("refusing disallowed action: %s", action)
                 await self._finish("escalated", "Refusing unsafe fix command. Handed to you")
                 return
-            self._pending_agent_restarts[self._service_id] = action
+            self._pending_agent_restarts[self._service_id] = {**action, "host_id": self._host_id}
             self._view = "fixing"
             self._elapsed = 0
             self._fixing_since = datetime.utcnow()
         elif self._method == "url":
-            await self._finish("escalated", "I can't restart a URL endpoint. Handing to you")
+            # An endpoint with a configured fix (a proxy route to re-register) is
+            # run by the agent on its host, exactly like a container action. One
+            # without a fix is still a human's problem.
+            action = self._proposed_fix_action or {}
+            if not self._url_fix_ready():
+                await self._finish("escalated", "I can't act on this endpoint. Handing to you")
+                return
+            self._pending_agent_restarts[self._service_id] = {**action, "host_id": self._host_id}
+            self._view = "fixing"
+            self._elapsed = 0
+            self._fixing_since = datetime.utcnow()
         elif self._method == "fly":
             action = self._proposed_fix_action or {}
             machine_id = action.get("container")
@@ -1005,7 +1080,7 @@ class ServiceMonitor:
             if manual:
                 await self._finish("took_over", "You took it")
             else:
-                await self._finish("resolved", f"Restarted {self._container}")
+                await self._finish("resolved", self._fix_done_phrase())
             return self._build_state()
 
     async def simulate(self) -> ActiveIncidentState:
@@ -1119,6 +1194,7 @@ class ServiceMonitor:
         self._method = None
         self._host_id = None
         self._tail_logs = False
+        self._check_failure = None
         self._llm_diagnosis = None
         self._llm_suggested_fix = None
         self._llm_confidence = None
@@ -1181,7 +1257,10 @@ class ServiceMonitor:
             location = snapshot.display_location()
             if snapshot.method == "url":
                 summary = f"{snapshot.name} is down"
-                diagnosis = f"URL check to {snapshot.url} failed."
+                diagnosis = (
+                    f"URL check to {snapshot.url} failed: "
+                    f"{snapshot.reason or 'no further detail'}."
+                )
             elif snapshot.method == "fly":
                 summary = f"{snapshot.name} is {severity}"
                 diagnosis = f"Fly machine {location} is {snapshot.state or 'not started'}."
@@ -1303,9 +1382,15 @@ class ServiceMonitor:
             db.close()
 
     def _record_learning(self, db: Session, incident: Incident):
-        # A Fly Machine isn't Docker; name the platform honestly.
-        platform = "fly" if self._method == "fly" else "docker"
-        rule_text = f"When {self._service_name} goes unhealthy, a {platform} restart brings it back."
+        if (self._proposed_fix_action or {}).get("action") == "register_proxy_route":
+            rule_text = (
+                f"When {self._service_name} stops answering, re-registering its "
+                "proxy route brings it back."
+            )
+        else:
+            # A Fly Machine isn't Docker; name the platform honestly.
+            platform = "fly" if self._method == "fly" else "docker"
+            rule_text = f"When {self._service_name} goes unhealthy, a {platform} restart brings it back."
         # Match on the rule, not the service id. A re-added host gives the same
         # container a fresh service id, and keying on it spawned a duplicate card
         # for what is the same recurring behavior.
@@ -1372,13 +1457,13 @@ class ServiceMonitor:
             view=self._view,
             elapsed=self._elapsed,
             autonomy=self._autonomy,
-            # Offer approve-restart only when it's actually runnable: at the ask
-            # step, not a URL (can't restart), and the model didn't say a restart
-            # won't help. See issues #33, #44.
+            # Offer the fix only when it's actually runnable: at the ask step, with
+            # an action to run (a URL without one has none), and not vetoed by the
+            # model. See issues #33, #44.
             can_approve=(
                 self._view == "asking"
-                and self._method != "url"
-                and self._llm_action != "none"
+                and bool(self._proposed_fix_action)
+                and not self._fix_vetoed()
             ),
             can_take_over=self._view in ("asking",) + ACTIVE_VIEWS,
             can_hand_back=self._view == "takeover",
@@ -1418,20 +1503,29 @@ class ServiceMonitor:
             return []
         name = self._container
         detected = {"kind": "done", "text": f"Detected: {name} is {self._severity}", "time": "now"}
-        # Name the platform and the verb honestly — a Fly machine isn't "docker".
-        platform = "fly" if self._method == "fly" else "docker"
-        verb = {"stop_container": "stop", "start_container": "start"}.get(
-            (self._proposed_fix_action or {}).get("action"), "restart"
-        )
+        action_name = (self._proposed_fix_action or {}).get("action")
+        # Name the platform and the verb honestly — a Fly machine isn't "docker",
+        # and re-registering a proxy route isn't a restart.
+        if self._method == "fly":
+            platform = "fly"
+        elif action_name == "register_proxy_route":
+            platform = "kamal-proxy"
+        else:
+            platform = "docker"
+        verb = {
+            "stop_container": "stop",
+            "start_container": "start",
+            "register_proxy_route": "route",
+        }.get(action_name, "restart")
 
         if self._view == "asking":
-            # When there's no runnable fix (a URL check can't be restarted, or the
+            # When there's no runnable fix (an endpoint Mino can't act on, or the
             # model judged a restart won't help — e.g. an OOM), don't lay out a
-            # restart plan the card has already ruled out. Match the heading.
-            restartable = self._method != "url" and self._llm_action != "none"
+            # plan the card has already ruled out. Match the heading.
+            restartable = bool(self._proposed_fix_action) and not self._fix_vetoed()
             if not restartable:
                 reason = (
-                    "I can't restart a URL check"
+                    "I can't act on this endpoint"
                     if self._method == "url"
                     else "a restart won't fix this"
                 )

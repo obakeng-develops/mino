@@ -157,7 +157,12 @@ export interface ActiveIncidentState {
   service_name: string | null;
   host_id?: string | null;
   method?: 'agent' | 'docker' | 'url' | 'fly' | null;
-  proposed_action?: 'restart_container' | 'stop_container' | 'start_container' | null;
+  proposed_action?:
+    | 'restart_container'
+    | 'stop_container'
+    | 'start_container'
+    | 'register_proxy_route'
+    | null;
   view: 'resting' | 'detecting' | 'diagnosing' | 'asking' | 'fixing' | 'verifying' | 'resolved' | 'takeover';
   elapsed: number;
   autonomy: 'auto_fix' | 'ask_first';
